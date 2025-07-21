@@ -7,7 +7,7 @@
 
 ---
 
-## Data
+## Data: Two Subsets of XWikiRef Dataset from https://github.com/DhavalTaunk08/XWikiGen/tree/main/XWikiRef
 
 ### `Data/Initial-20`
 - Raw dataset, organized by language folders: `bn`, `en`, `hi`.
