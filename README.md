@@ -7,15 +7,17 @@
 
 ---
 
-## Data: 
+## Data
 Two Subsets are created from the XWikiRef Dataset ( https://github.com/DhavalTaunk08/XWikiGen/tree/main/XWikiRef ). Subset comprises three languages- Bengali (bn), English (en), and Hindi (hi), and each language contains four domains (films, sportsman, books, and writers).
 
-### `Data/Initial-20`: The First 20 articles from each language-domain pair are taken to create this subset
+### `Data/Initial-20`
+The First 20 articles from each language-domain pair are taken to create this subset
 - Raw dataset, organized by language folders: `bn`, `en`, `hi`.
 - Each language folder contains JSON files for:
   - `films`, `sportsman`, `books`, `writers`.
 
-### `Data/Curated-20`: selection of 20 better articles from each language-domain pair to create this subset (English subset is similar to Initial-20)
+### `Data/Curated-20` 
+selection of 20 better articles from each language-domain pair to create this subset (English subset is similar to Initial-20)
 - Raw dataset, organized by language folders: `bn`, `en`, `hi`.
 - Each language folder contains JSON files for:
   - `films`, `sportsman`, `books`, `writers`.
