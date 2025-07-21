@@ -23,7 +23,7 @@ selection of 20 better articles from each language-domain pair to create this su
   - `films`, `sportsman`, `books`, `writers`.
 - Organized similarly by language and domain.
 - `clean.py` script is used to preprocess raw data.
-- Preprocessed data is saved inside the cleaned folder of each language (e.g., `Data/bn/cleaned/bn_writers.json`). 
+- Preprocessed data is saved inside the `cleaned` folder of each language (e.g., `Data/bn/cleaned/bn_writers.json`). 
 
 ### Scripts
 - `clean.py` – Preprocesses each (language, domain) JSON file (e.g., `bn_writers.json`).
@@ -36,7 +36,7 @@ selection of 20 better articles from each language-domain pair to create this su
 ## Extractive Stage
 
 ### Folder: `extractive/`
-- `extractive.py` / `extractive.sh` – Extracts top-k salient sentences from cleaned language-domain data.
+- `extractive.{py, sh}` – Extracts top-k salient sentences from cleaned language-domain data.
 
 ---
 
