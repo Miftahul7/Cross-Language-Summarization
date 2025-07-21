@@ -76,8 +76,11 @@ Each script takes CSV predictions from testing and produces a domain/language-wi
 ---
 
 ## Requirements
-
-All dependencies are listed in `requirements.txt`. Install them with:
+# Install GPU-enabled PyTorch
+```bash
+pip install torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121 -f https://download.pytorch.org/whl/torch_stable.html
+```
+#All dependencies are listed in `requirements.txt`. Install them with:
 
 ```bash
 pip install -r requirements.txt
