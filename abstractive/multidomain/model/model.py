@@ -9,12 +9,11 @@ together with:
 - `train_mD.py`: The main training script that instantiates `Summarizer` and `DataModule`, configures logging, checkpointing, distributed training, and launches training.
 
 Key Features:
-- Supports **mBART** and **mT5** architectures for multilingual summarization.
+- Supports mBART and mT5 architectures for multilingual summarization.
 - Provides training, validation, testing, and prediction steps in the
   PyTorch Lightning lifecycle.
-- Computes **ROUGE** scores during validation and testing for summarization
+- Computes ROUGE scores during validation and testing for summarization
   quality evaluation.
-- Writes test predictions and metrics to CSV files for later inspection. 
 """
 import pytorch_lightning as pl
 from transformers import MBartForConditionalGeneration, MT5ForConditionalGeneration, AutoConfig, AutoModelForSeq2SeqLM, MBartTokenizer
