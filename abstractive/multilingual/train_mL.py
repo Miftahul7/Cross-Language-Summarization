@@ -1,4 +1,28 @@
 """This code is a modified version provided at https://github.com/DhavalTaunk08/XWikiGen/tree/main"""
+"""Multilingual Abstractive Summarization — Training Script.
+This module wires together the data pipeline (``DataModule``) and model (``Summarizer``)
+for multilingual abstractive summarization using PyTorch Lightning. It:
+
+1) parses CLI arguments,
+2) initializes the tokenizer, datasets, and model,
+3) configures logging, checkpointing, precision, and distributed strategy,
+4) resumes from the most recent checkpoint if found, and
+5) launches training/validation.
+
+Key components:
+- ``model.Summarizer``: LightningModule that wraps an HF seq2seq model (mBART/mT5).
+- ``dataloader.DataModule``: LightningDataModule producing train/val/test loaders.
+- ``pytorch_lightning.Trainer``: Orchestrates training/validation loops.
+
+Side effects:
+- Creates directories (``prediction_path`` and checkpoint dir) when missing.
+- Logs metrics to Weights & Biases (W&B) with ``WANDB_SILENT=True``.
+- Writes checkpoints under ``{save_dir}{exp_name}/lightning-checkpoints``.
+
+Notes:
+- ``wandb.login(key=" ")`` is a placeholder; supply your API key via env var
+  (``WANDB_API_KEY``) or a configured login.
+"""
 from model.model import Summarizer 
 from model.dataloader import DataModule
 import pytorch_lightning as pl
@@ -17,7 +41,12 @@ import wandb
 wandb.login(key=" ") #API KEY
 
 def main(args):
-    
+     """Entry point: configure data, model, trainer, and run training.
+
+    This function builds a ``DataModule`` and a ``Summarizer`` from CLI arguments,
+    sets up checkpointing and W&B logging, checks GPU availability, and calls
+    ``Trainer.fit`` (resuming from the latest checkpoint if present)."""
+    # Paths and identifiers
     train_path = args.train_path
     val_path = args.val_path
     test_path = args.test_path
@@ -25,15 +54,15 @@ def main(args):
     tokenizer_name_or_path = args.tokenizer
     model_name_or_path = args.model
     is_mt5 = args.is_mt5
-
+    # Fallback: if config not given, reuse model identifier
     if args.config is not None:
         config = args.config
     else:
         config = model_name_or_path
-
+    # Ensure prediction output directory exists
     if not os.path.exists(args.prediction_path):
         os.system(f'mkdir -p {args.prediction_path}')
-
+    # Core hyperparameters
     n_gpus = args.n_gpus
     strategy = args.strategy
     EXP_NAME = args.exp_name
@@ -45,7 +74,7 @@ def main(args):
     max_source_length = args.max_source_length
     max_target_length = args.max_target_length
     prediction_path = args.prediction_path
-
+    # Data module
     dm_hparams = dict(
         train_path=train_path,
         val_path=val_path,
@@ -60,7 +89,7 @@ def main(args):
         
     )
     dm = DataModule(**dm_hparams)
-
+     # Model
     model_hparams = dict(
         learning_rate=1e-5,
         model_name_or_path=model_name_or_path,
@@ -73,7 +102,7 @@ def main(args):
     )
 
     model = Summarizer(**model_hparams)
-   
+     # Sanity check
     if args.sanity_run=='yes':
         log_model = False
         limit_train_batches = 4
@@ -101,6 +130,7 @@ def main(args):
     if args.n_gpus > available_gpus:
         print(f"Requested {args.n_gpus} GPUs, but only {available_gpus} are available.")
         args.n_gpus = available_gpus
+    # Trainer
     trainer_hparams = dict(
         devices=args.n_gpus,
         accelerator='gpu' if args.n_gpus > 0 else 'cpu',
