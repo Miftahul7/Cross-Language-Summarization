@@ -1,4 +1,31 @@
 """This code is a modified version provided at https://github.com/DhavalTaunk08/XWikiGen/tree/main"""
+"""Training entry point for Multilingual–Multidomain abstractive summarization.
+This script wires together the model and data components to run training with
+PyTorch Lightning. It uses:
+- `model/model.py` → `Summarizer`: LightningModule that wraps mBART or mT5
+  for abstractive summarization (generation + ROUGE evaluation).
+- `model/dataloader.py` → `DataModule`: Lightning DataModule that prepares
+  JSONL-backed datasets and returns DataLoaders for train/val/test.
+
+Core features:
+- Mixed precision training (`precision="16-mixed"`).
+- Optional multi-GPU training via `--strategy` (e.g., "ddp", "dp").
+- Automatic checkpointing of the best model (`val_loss`) with resumption from
+  the most recent checkpoint.
+- Weights & Biases logging via `WandbLogger` (set `WANDB_SILENT=True`).
+- Lightweight “sanity” mode (`--sanity_run yes`) that limits batch counts for
+  a quick end-to-end sanity test.
+
+Outputs:
+- Checkpoints: `checkpoints/<exp_name>/lightning-checkpoints/*.ckpt`
+- Prediction CSVs: written by the model to `--prediction_path` during testing
+
+Environment & dependencies:
+- PyTorch Lightning, Transformers, rouge, pandas, wandb
+- WANDB: This script calls `wandb.login(key=" ... ")`. You can pass a
+  key here, set the environment variable `WANDB_API_KEY`.
+
+"""
 from model.model import Summarizer 
 from model.dataloader import DataModule
 import pytorch_lightning as pl
@@ -17,6 +44,17 @@ import wandb
 wandb.login(key=" ") #api key 
 
 def main(args):
+    """ Configure data, model, trainer, and launch training.
+
+    Steps
+    -----
+    1) Parse paths and hyperparameters from `args`.
+    2) Instantiate `DataModule` with tokenizer name/path and max lengths.
+    3) Build `Summarizer` with generation/eval settings and pass the tokenizer.
+    4) Configure logging (`WandbLogger`) and checkpointing (`ModelCheckpoint`).
+    5) Create a Lightning `Trainer` with the requested devices/strategy.
+    6) Resume from the latest checkpoint (if present) and call `trainer.fit`.
+    """
     
     train_path = args.train_path
     val_path = args.val_path
@@ -38,7 +76,6 @@ def main(args):
     strategy = args.strategy
     EXP_NAME = args.exp_name
     save_dir = args.save_dir
-    #target_lang = args.target_lang
     num_epochs = args.num_epochs
     train_batch_size = args.train_batch_size
     val_batch_size = args.val_batch_size
@@ -46,7 +83,7 @@ def main(args):
     max_source_length = args.max_source_length
     max_target_length = args.max_target_length
     prediction_path = args.prediction_path
-
+    # DataModule
     dm_hparams = dict(
         train_path=train_path,
         val_path=val_path,
@@ -58,10 +95,9 @@ def main(args):
         train_batch_size=train_batch_size,
         val_batch_size=val_batch_size,
         test_batch_size=test_batch_size,
-        #target_lang=target_lang
     )
     dm = DataModule(**dm_hparams)
-
+    # Model assembly
     model_hparams = dict(
         learning_rate=1e-5,
         model_name_or_path=model_name_or_path,
@@ -70,12 +106,11 @@ def main(args):
         eval_beams=2,
         tgt_max_seq_len=max_target_length,
         tokenizer=dm.tokenizer,
-        #target_lang=target_lang,
         prediction_path=prediction_path
     )
 
     model = Summarizer(**model_hparams)
-   
+   # Sanity check, Trainer & logging settings
     if args.sanity_run=='yes':
         log_model = False
         limit_train_batches = 4
