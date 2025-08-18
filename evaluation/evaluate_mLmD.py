@@ -1,3 +1,28 @@
+"""Aggregate ROUGE-L report of prediction CSVs produced by the (abstractive/ML-MD/testing/testing_{mbart/mt5}.py).
+
+This utility loads the per-example predictions CSV produced by the
+`testing_mbart.py` or `testing_mt5.py` evaluation scripts and builds a compact
+JSON report of average ROUGE-L F1 scores:
+  - per (domain, target-language) pair
+  - per domain (average over its languages)
+  - overall average across all selected domains and languages
+
+It reads:
+A CSV at `file_path` containing at least the following columns:
+- `domain`     : str  — domain/category label (e.g., "books", "films")
+- `tgt_lang`   : str  — target language code (e.g., "en_XX", "hi_IN", "bn_IN")
+- `pred_text`  : str  — model prediction (one example per row)
+- `ref_text`   : str  — reference/ground-truth summary
+Optional columns (ignored by this script): `src_lang`, `input_text`, etc.
+
+It computes:
+For each selected domain in `domains` and target language in `languages`:
+- Iterates example rows, computes ROUGE-L F1 (via `rouge.get_scores`),
+  multiplies by 100 (percentage), and averages across rows.
+- Stores per-(domain, language) averages and the per-domain average (across
+  its languages). Also computes a global overall average (macro across all
+  collected per-example scores). 
+  """
 import pandas as pd
 import json
 from tqdm import tqdm
