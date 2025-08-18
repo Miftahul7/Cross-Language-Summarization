@@ -1,4 +1,4 @@
-"""Aggregate multidomain ROUGE-L report across languages and domains (mBART/mT5).
+"""Aggregate Multidomain ROUGE-L report across languages and domains ( separately for mBART and mT5).
 
 This script scans a folder of per-example prediction CSVs (3 per language per model in this project), computes average ROUGE-L F1 (%) per
 (domain, language), per-language macro averages, and a global overall average,
