@@ -1,4 +1,20 @@
 """This code is a modified version provided at https://github.com/DhavalTaunk08/XWikiGen/tree/main"""
+""" This module defines a PyTorch Lightning ``LightningModule`` that fine-tunes and evaluates
+sequence-to-sequence models (mBART or mT5) for multilingual abstractive summarization.
+It supports both generative training and ROUGE-based validation.
+
+Key features:
+- Selects between ``MBartForConditionalGeneration`` and ``MT5ForConditionalGeneration`` based on the ``is_mt5`` hyperparameter.
+- Handles mBART target language forcing via ``forced_bos_token_id``.
+- Decodes predictions and references for ROUGE evaluation at validation time.
+- Provides standard Lightning hooks for training/validation/testing/prediction.
+
+Notes:
+- ``test_epoch_end`` expects language information in ``outputs`` and uses ``languages_map``
+  to aggregate metrics per language; adapt to the data format as needed.
+- When ``is_mt5`` is ``True``, target labels with ignore index ``-100`` are temporarily
+  remapped to ``pad_token_id`` for decoding during generation.
+"""
 import pytorch_lightning as pl
 from transformers import MBartForConditionalGeneration, MT5ForConditionalGeneration, AutoConfig, AutoModelForSeq2SeqLM, MBartTokenizer
 import torch
@@ -7,7 +23,16 @@ import json
 import pandas as pd
 
 class Summarizer(pl.LightningModule):
+    """The module wraps a Hugging Face seq2seq model and provides training and
+    evaluation routines compatible with PyTorch Lightning. It supports language-aware
+    generation for mBART via ``forced_bos_token_id`` and computes ROUGE metrics at
+    validation time."""
+
     def __init__(self, *args, **kwargs):
+        """Initialize the summarization module and underlying Hugging Face model.
+
+        Parameters are taken from ``self.hparams`` (populated via Lightning's
+        argument parsing or manual instantiation). """
         super().__init__()
         self.save_hyperparameters()
         self.rouge = Rouge()
@@ -17,7 +42,7 @@ class Summarizer(pl.LightningModule):
             self.model = MT5ForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
         else:
             self.model = MBartForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
-
+        # Minimal ISO-2 → mBART language code map; extend if needed.
         self.languages_map = {
             'bn': 'bn_IN',
             'en': 'en_XX',
@@ -25,17 +50,44 @@ class Summarizer(pl.LightningModule):
         }
 
     def forward(self, input_ids, attention_mask, labels):
+        """Forward pass through the underlying seq2seq model.
+        Args:
+            input_ids (torch.LongTensor): Tokenized source ids ``[batch, src_len]``.
+            attention_mask (torch.LongTensor): Attention mask ``[batch, src_len]``.
+            labels (torch.LongTensor): Tokenized target ids ``[batch, tgt_len]``.
+        Returns:
+            transformers.modeling_outputs.Seq2SeqLMOutput: The HF output object containing loss and logits among other fields.
+        """
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return outputs
 
     def _step(self, batch):
+         """Compute the training/validation loss for one batch.
+        Args:
+            batch (dict): A batch with keys ``input_ids``, ``attention_mask``,``labels``, ``src_lang``, ``tgt_lang``.
+        Returns:
+            torch.Tensor: Scalar loss tensor.
+        """
         input_ids, attention_mask, labels, src_lang, tgt_lang = batch['input_ids'], batch['attention_mask'], batch['labels'], batch['src_lang'], batch['tgt_lang']
-        outputs = self(input_ids, attention_mask, labels)
+        outputs = self(input_ids, attention_mask, labels) # src_lang and tgt_lang are present for downstream use; not needed for loss.
         loss = outputs[0]
         return loss
     
      
     def _generative_step(self, batch):
+         """Run constrained generation (mBART) or standard generation (mT5) and decode.
+         For mBART, this method sets ``forced_bos_token_id`` using the target language
+         provided by the batch. For mT5, generation proceeds without language forcing.
+        After generation, the method decodes input, prediction, and reference texts.
+
+        Args:
+            batch (dict): A batch with keys ``input_ids``, ``attention_mask``,
+                ``labels``, and ``tgt_lang`` (string codes like ``'en_XX'`` for mBART).
+
+        Returns:
+            Tuple[List[str], List[str], List[str]]: ``(input_text, pred_text, ref_text)``
+            where each element is a list of decoded strings, one per batch item.
+        """
         tgt_lang = batch['tgt_lang'][0]
 
         if not self.hparams.is_mt5:
@@ -72,12 +124,19 @@ class Summarizer(pl.LightningModule):
         return input_text, pred_text, ref_text
 
     def training_step(self, batch, batch_idx):
+        """Standard Lightning training step.
+        Logs ``train_loss`` (epoch-aggregated) and returns a dict containing ``loss``
+        for Lightning's optimization loop.
+        """
         loss = self._step(batch)
         self.log("train_loss", loss, on_epoch=True)
         return {'loss': loss}
     def on_validation_epoch_start(self):
+        """Reset containers at the start of each validation epoch."""
         self.validation_outputs = []
     def validation_step(self, batch, batch_idx):
+        """Validation step that logs loss and stores decoded strings for ROUGE."""
+
         loss = self._step(batch)
         input_text, pred_text, ref_text = self._generative_step(batch)
         self.log("val_loss", loss, on_epoch=True)
@@ -85,6 +144,11 @@ class Summarizer(pl.LightningModule):
         return 
 
     def on_validation_epoch_end(self):
+        """Compute and log ROUGE metrics at the end of the validation epoch.
+        This method concatenates predictions and references collected during
+        ``validation_step``, replaces any empty strings with a default placeholder,
+        computes ROUGE-1/ROUGE-2/ROUGE-L (precision/recall/F1), and logs the results.
+        """
         pred_text = []
         ref_text = []
         for x in self.validation_outputs:
@@ -120,10 +184,12 @@ class Summarizer(pl.LightningModule):
         # Clear validation outputs after each epoch
         self.validation_outputs = []
     def predict_step(self, batch, batch_idx):
+         """Lightning predict step: return decoded inputs/preds/refs for downstream use."""
         input_text, pred_text, ref_text = self._generative_step(batch)
         return {'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text}
 
     def test_step(self, batch, batch_idx):
+         """Lightning test step: compute loss and return decoded strings."""
         loss = self._step(batch)
         input_text, pred_text, ref_text = self._generative_step(batch)
         return {'test_loss': loss, 'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text}
@@ -181,10 +247,11 @@ class Summarizer(pl.LightningModule):
 
     @staticmethod
     def add_model_specific_args(parent_parser):
+         """Register model-specific CLI arguments on the provided parser."""
         parser = parent_parser.add_argument_group('Bart Fine-tuning Parameters')
         parser.add_argument('--learning_rate', default=1e-5, type=float)
         parser.add_argument('--model_name_or_path', default='bart-base', type=str)
         parser.add_argument('--eval_beams', default=1, type=int)
         parser.add_argument('--tgt_max_seq_len', default=128, type=int)
         parser.add_argument('--tokenizer', default='bart-base', type=str)
-        return parent_parser
+        return parent_parser #used in train_mL.py
