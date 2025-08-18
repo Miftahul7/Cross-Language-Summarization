@@ -1,10 +1,26 @@
 """This code is a modified version provided at https://github.com/DhavalTaunk08/XWikiGen/tree/main"""
+"""mBART-centric testing/inference script for multilingual abstractive summarization.
+
+This script evaluates a trained mBART sequence-to-sequence model on
+JSONL-formatted test data using PyTorch Lightning. It computes ROUGE scores
+overall and per target language, and writes detailed per-example outputs.
+
+Although some code paths exist for mT5, this file is primarily intended for
+mBART evaluation:
+- Uses `tokenizer.src_lang` / `tokenizer.tgt_lang` and `forced_bos_token_id`.
+- Decodes predictions with the mBART tokenizer’s language-aware settings.
+- Aggregates results per mBART language code (e.g., `en_XX`, `hi_IN`, `bn_IN`).
+
+Outputs:
+    - W&B logs (if enabled via the Lightning `WandbLogger`).
+    - CSV with per-example predictions at:
+      `abstractive/ML-MD/predictions/<model>_prediction/lang_wise_combined_<model>.csv`.
+"""
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from transformers import AutoTokenizer
 import pandas as pd
 import json
-import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from transformers import MBartForConditionalGeneration, MT5ForConditionalGeneration, AutoConfig, AutoModelForSeq2SeqLM, MBartTokenizer
 import torch
@@ -13,8 +29,14 @@ from rouge import Rouge
 import sys
 import os
 
-
 class Dataset1(Dataset):
+    """JSONL dataset for multilingualimultidomain summarization.
+    The source text is constructed as:
+        "page_title section_title <joined references>"
+    For mBART, the dataset sets `tokenizer.src_lang`/`tokenizer.tgt_lang`
+    and relies on those during tokenization; labels are not modified.
+    (For mT5, labels' PAD tokens are typically mapped to -100; see code paths.)
+    """
     def __init__(self, data_path, tokenizer, max_source_length, max_target_length, is_mt5):
         fp = open(data_path, 'r')
         self.df = [json.loads(line, strict=False) for line in fp.readlines()]
@@ -22,6 +44,7 @@ class Dataset1(Dataset):
         self.max_source_length = max_source_length
         self.max_target_length = max_target_length
         self.is_mt5 = is_mt5
+        # mBART language codes used for src/tgt_lang control
         self.languages_map = {
             'bn': {0:'bn_IN'},
             'en': {0:'en_XX'},
@@ -29,11 +52,15 @@ class Dataset1(Dataset):
             
         }
 
-
     def __len__(self):
+        """Return dataset size."""
         return len(self.df)
 
     def __getitem__(self, idx):
+        """Tokenize a single example.
+        For mBART:
+            - Sets `tokenizer.src_lang` and `tokenizer.tgt_lang`.
+            - Tokenizes source and target separately."""
         input_text = ' '.join(self.df[idx]['references'])
         input_text = str(self.df[idx]['page_title'] + ' ' + self.df[idx]['section_title'] + ' ' + input_text)
         target_text = self.df[idx]['content']
@@ -104,12 +131,15 @@ class Dataset1(Dataset):
 
 
 class DataModule(pl.LightningDataModule):
+    """Lightning DataModule that produces DataLoaders for testing."""
     def __init__(self, *args, **kwargs):
+        """Save hyperparameters and prepare the tokenizer."""
         super().__init__()
         self.save_hyperparameters()
         self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer_name_or_path)
         
     def setup(self, stage=None):
+        """Create train/val/test datasets (same schema; test is used here)."""
         self.train = Dataset1(self.hparams.train_path, self.tokenizer, self.hparams.max_source_length, self.hparams.max_target_length, self.hparams.is_mt5)
         self.val = Dataset1(self.hparams.val_path, self.tokenizer, self.hparams.max_source_length, self.hparams.max_target_length, self.hparams.is_mt5)
         self.test = Dataset1(self.hparams.test_path, self.tokenizer, self.hparams.max_source_length, self.hparams.max_target_length, self.hparams.is_mt5)
@@ -121,14 +151,28 @@ class DataModule(pl.LightningDataModule):
         return DataLoader(self.val, batch_size=self.hparams.val_batch_size, num_workers=1,shuffle=False)
 
     def test_dataloader(self):
+        """Return the test DataLoader used by `Trainer.test`."""
         return DataLoader(self.test, batch_size=self.hparams.test_batch_size, num_workers=1,shuffle=False)
 
     def predict_dataloader(self):
+        """Alias to test dataloader for convenience."""
         return self.test_dataloader()
         
 
 class Summarizer(pl.LightningModule):
+    """LightningModule wrapper for mBART inference & ROUGE evaluation.
+
+    For mBART:
+        - Loads `MBartForConditionalGeneration`.
+        - Uses `forced_bos_token_id` derived from `tokenizer.lang_code_to_id`.
+        - Decodes predictions with the configured `tgt_lang`.
+
+    The module aggregates predictions over the test epoch, computes ROUGE
+    (overall and per target language), logs them via the configured logger,
+    and exports a CSV with detailed rows.
+    """
     def __init__(self, *args, **kwargs):
+        """Initialize model and evaluation utilities."""
         super().__init__()
         self.save_hyperparameters()
         self.rouge = Rouge()
@@ -136,7 +180,7 @@ class Summarizer(pl.LightningModule):
             self.model = MT5ForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
         else:
             self.model = MBartForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
-
+        #mbart language code mapping
         self.languages_map = {
             'bn': {0:'bn_IN'},
             'en': {0:'en_XX'},
@@ -145,20 +189,27 @@ class Summarizer(pl.LightningModule):
         }
 
     def forward(self, input_ids, attention_mask, labels):
+         """Forward pass; returns HuggingFace Seq2SeqLMOutput with loss/logits."""
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return outputs
 
     def _step(self, batch):
+         """Compute supervised training/eval loss on a batch."""
         input_ids, attention_mask, labels, src_lang, tgt_lang, domain = batch['input_ids'], batch['attention_mask'], batch['labels'], batch['src_lang'], batch['tgt_lang'], batch['domain']
         outputs = self(input_ids, attention_mask, labels)
         loss = outputs[0]
         return loss
     
     def _generative_step(self, batch):
+        """Run mBART generation and decode strings:
+            - Uses `lang_code_to_id[tgt_lang]` to set `forced_bos_token_id`.
+            - Ensures `tokenizer.tgt_lang` is a valid mBART code (fallback used).
+            """
+
         tgt_lang = batch['tgt_lang'][0]
 
         if not self.hparams.is_mt5:
-            # For mBART
+            # For mBART generation with BOS forcing
             token_id = self.hparams.tokenizer.lang_code_to_id.get(tgt_lang, 250010)
             self.hparams.tokenizer.tgt_lang = tgt_lang if tgt_lang in self.hparams.tokenizer.lang_code_to_id else 'hi_IN'
             generated_ids = self.model.generate(
@@ -202,6 +253,7 @@ class Summarizer(pl.LightningModule):
         return 
 
     def validation_epoch_end(self, outputs):
+        """Aggregate val predictions and log ROUGE (if outputs include texts)."""
 
         pred_text = []
         ref_text = []
@@ -237,12 +289,15 @@ class Summarizer(pl.LightningModule):
 
 
     def predict_step(self, batch, batch_idx):
+        """Return decoded strings for downstream analysis"""
         input_text, pred_text, ref_text, src_lang, tgt_lang, domain = self._generative_step(batch)
         return {'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text}
     def on_test_epoch_start(self):
+        """Initialize container for per-batch test outputs."""
         self.test_outputs = []
 
     def test_step(self, batch, batch_idx):
+        """Compute test loss and collect decoded strings."""
         loss = self._step(batch)
         input_text, pred_text, ref_text, src_lang, tgt_lang, domain = self._generative_step(batch)
         output = {
@@ -257,6 +312,9 @@ class Summarizer(pl.LightningModule):
         self.test_outputs.append(output)
         return output
     def on_test_epoch_end(self):
+        """Aggregate test results, compute ROUGE per target language, save CSV.
+        For mBART, per-language grouping is based on the decoded `tgt_lang`
+        codes (e.g., `en_XX`, `hi_IN`, `bn_IN`)."""
         input_texts = []
         pred_texts = []
         ref_texts = []
@@ -370,6 +428,7 @@ if __name__ == "__main__":
         model_name = args.model
         is_mt5 = 0
     print('-----------------------------------------------------------------------------------------------------------')
+    # Example default paths; override via CLI if needed.
     train_path = 'XWikiRef/combined_split/mixed_train.json'
     val_path = 'XWikiRef/combined_split/mixed_val.json'
     test_path = 'XWikiRef/combined_split/mixed_test.json'
