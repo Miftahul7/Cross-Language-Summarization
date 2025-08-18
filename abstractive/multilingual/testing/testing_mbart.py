@@ -1,9 +1,24 @@
+"""mBART Inference & Evaluation Script.
+This module provides a minimal, self-contained pipeline to load a trained checkpoint
+of mBART, run test-time generation, and report ROUGE scores with
+optional per-language breakdown.
+
+Main components
+- ``Dataset1``: JSONL-backed dataset that prepares source/target pairs and sets
+  appropriate language handling (mBART: tokenizer ``.src_lang``/``.tgt_lang``).
+- ``DataModule``: Lightning DataModule that builds dataloaders; designed for testing
+- ``Summarizer``: LightningModule that wraps a HF seq2seq model mBART, provides
+  a generation helper, and aggregates ROUGE results.
+
+Notes:
+- This script logs per-language ROUGE to W&B using a global ``logger`` constructed in
+  ``__main__``.
+"""
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from transformers import AutoTokenizer
 import pandas as pd
 import json
-import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from transformers import MBartForConditionalGeneration, MT5ForConditionalGeneration, AutoConfig, AutoModelForSeq2SeqLM, MBartTokenizer
 import torch
@@ -14,6 +29,22 @@ import os
 
 
 class Dataset1(Dataset):
+     """JSONL-backed dataset for multilingual abstractive summarization (test-time).
+
+    Each JSON line must contain fields like ``page_title``, ``section_title``,
+    ``references`` (List[str]), ``content`` (str), and ``src_lang``/``tgt_lang``
+    language codes (e.g., ``"en"``, ``"bn"``, ``"hi"``). The dataset:
+
+    - Concatenates the references with titles to form the source text.
+    - For mBART: sets ``tokenizer.src_lang`` and ``tokenizer.tgt_lang``..
+
+    Args:
+        data_path (str): Path to JSONL file.
+        tokenizer: Hugging Face tokenizer matching the model.
+        max_source_length (int): Max input length (pad/truncate to this).
+        max_target_length (int): Max target length (pad/truncate to this).
+        is_mt5 (bool/int): Whether the model is mT5 (1/True) or mBART (0/False).
+    """
     def __init__(self, data_path, tokenizer, max_source_length, max_target_length, is_mt5):
         fp = open(data_path, 'r')
         self.df = [json.loads(line, strict=False) for line in fp.readlines()]
@@ -28,11 +59,17 @@ class Dataset1(Dataset):
             
         }
 
-
     def __len__(self):
+         """Return the number of samples in the JSONL file."""
         return len(self.df)
 
     def __getitem__(self, idx):
+         """Build a single tokenized example for inference/evaluation.
+
+        The source text is ``page_title + section_title + ' '.join(references)`` and
+        the target text is the ``content`` field. Language codes default to English if
+        unknown."""
+
         input_text = ' '.join(self.df[idx]['references'])
         input_text = str(self.df[idx]['page_title'] + ' ' + self.df[idx]['section_title'] + ' ' + input_text)
         target_text = self.df[idx]['content']
@@ -101,7 +138,9 @@ class Dataset1(Dataset):
 
 
 class DataModule(pl.LightningDataModule):
+    """Lightning DataModule for test-time evaluation."""
     def __init__(self, *args, **kwargs):
+         """Initialize the DataModule and load the tokenizer from pretrained name/path."""
         super().__init__()
         self.save_hyperparameters()
         self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer_name_or_path)
@@ -118,14 +157,22 @@ class DataModule(pl.LightningDataModule):
         return DataLoader(self.val, batch_size=self.hparams.val_batch_size, num_workers=1,shuffle=False)
 
     def test_dataloader(self):
+        """Return the test dataloader used by ``Trainer.test``."""
         return DataLoader(self.test, batch_size=self.hparams.test_batch_size, num_workers=1,shuffle=False)
 
     def predict_dataloader(self):
+        """Alias to ``test_dataloader`` for Lightning's predict loop."""
         return self.test_dataloader()
         
 
 class Summarizer(pl.LightningModule):
+    """LightningModule for running generation and ROUGE evaluation at test time."""
+
     def __init__(self, *args, **kwargs):
+        """Initialize the underlying HF model and ROUGE scorer.
+
+        Uses ``self.hparams`` to select mBART vs mT5, beam size, etc.
+        """
         super().__init__()
         self.save_hyperparameters()
         self.rouge = Rouge()
@@ -133,7 +180,7 @@ class Summarizer(pl.LightningModule):
             self.model = MT5ForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
         else:
             self.model = MBartForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
-
+        # As in the dataset, keeps nested dicts for compatibility with existing code.
         self.languages_map = {
             'bn': {0:'bn_IN'},
             'en': {0:'en_XX'},
@@ -142,6 +189,7 @@ class Summarizer(pl.LightningModule):
         }
 
     def forward(self, input_ids, attention_mask, labels):
+        """Forward pass through the seq2seq model to obtain the loss/logits."""
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return outputs
 
@@ -152,6 +200,13 @@ class Summarizer(pl.LightningModule):
         return loss
     
     def _generative_step(self, batch):
+         """Generate summaries and decode inputs/predictions/references.
+
+        For mBART, uses ``forced_bos_token_id`` derived from the target language code.
+        Returns:
+            Tuple[List[str], List[str], List[str], List[str], List[str]]: input, pred,
+            ref, src_lang, tgt_lang (lists of strings).
+        """
         tgt_lang = batch['tgt_lang'][0]
 
         if not self.hparams.is_mt5:
@@ -235,12 +290,15 @@ class Summarizer(pl.LightningModule):
 
 
     def predict_step(self, batch, batch_idx):
+        """Lightning predict step: return decoded strings for downstream analysis."""
         input_text, pred_text, ref_text, src_lang, tgt_lang = self._generative_step(batch)
         return {'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text}
     def on_test_epoch_start(self):
+        """Initialize buffers for collecting test outputs across batches."""
         self.test_outputs = []
 
     def test_step(self, batch, batch_idx):
+        """Lightning test step: compute loss, decode strings, and buffer outputs."""
         loss = self._step(batch)
         input_text, pred_text, ref_text, src_lang, tgt_lang = self._generative_step(batch)
         output = {
@@ -254,6 +312,9 @@ class Summarizer(pl.LightningModule):
         self.test_outputs.append(output)
         return output
     def on_test_epoch_end(self):
+        """Aggregate and log per-language ROUGE, and write a CSV of detailed results.
+
+        This method expects a global ``logger`` (``WandbLogger``) defined in ``__main__``."""
         input_texts = []
         pred_texts = []
         ref_texts = []
