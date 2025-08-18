@@ -6,7 +6,7 @@ This module defines the `Summarizer` class, a LightningModule wrapper around
 transformers-based seq2seq models (mBART or mT5). It is designed to be used
 together with:
 - `dataloader.py`: Provides the `DataModule` for reading and tokenizing JSONL data.
-- `train.py`: The main training script that instantiates `Summarizer` and `DataModule`, configures logging, checkpointing, distributed training, and launches training.
+- `train_mD.py`: The main training script that instantiates `Summarizer` and `DataModule`, configures logging, checkpointing, distributed training, and launches training.
 
 Key Features:
 - Supports **mBART** and **mT5** architectures for multilingual summarization.
