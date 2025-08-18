@@ -1,10 +1,27 @@
 """This code is a modified version provided at https://github.com/DhavalTaunk08/XWikiGen/tree/main"""
+"""mT5 testing/inference for multilingual-multidomain abstractive summarization.
+
+This script evaluates a trained mT5 sequence-to-sequence model on
+JSONL-formatted data using PyTorch Lightning. It performs generation,
+computes ROUGE scores (overall and per target language), and exports
+per-example results.
+
+mT5 specifics:
+- Language control via ``in-text prompts`` (prefix target/source code tokens like "en_XX", "hi_IN") rather than tokenizer config fields.
+- Label padding is replaced with ``-100`` so PAD positions are ignored by the cross-entropy loss.
+- No `forced_bos_token_id` (unlike mBART).
+- Generation uses standard `model.generate(...)` with `num_beams` and `max_length`.
+
+Outputs:
+- Test-time metrics logged via Lightning logger (e.g., W&B if configured).
+- CSV with per-example rows at:
+  `abstractive/ML-MD/predictions/<model>_prediction/lang_wise_combined_<model>.csv`
+"""
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from transformers import AutoTokenizer
 import pandas as pd
 import json
-import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from transformers import MBartForConditionalGeneration, MT5ForConditionalGeneration, AutoConfig, AutoModelForSeq2SeqLM, MBartTokenizer
 import torch
@@ -14,6 +31,14 @@ import sys
 import os
 
 class Dataset1(Dataset):
+    """JSONL dataset for multilingual summarization.
+    Builds the source text as:
+        "page_title section_title <joined references>"
+
+    For mT5, language is supplied ``in-text`` by prefixing the language code
+    (e.g., "en_XX", "hi_IN") to both source and target strings, followed by a
+    closing `</s>` token. Labels' PAD tokens are set to -100 (ignore index)."""
+
     def __init__(self, data_path, tokenizer, max_source_length, max_target_length, is_mt5):
         fp = open(data_path, 'r')
         self.df = [json.loads(line, strict=False) for line in fp.readlines()]
@@ -28,9 +53,21 @@ class Dataset1(Dataset):
         }
 
     def __len__(self):
+        """Return the number of examples."""
         return len(self.df)
 
     def __getitem__(self, idx):
+        """Return a tokenized example with mT5 prompts and label masking.
+        mT5 behavior:
+            - Prefix `src_lang` before the source text and `tgt_lang` before
+              the target text: "<lang> <text> </s>".
+            - Replace PAD tokens in labels with -100.
+        Returns:
+            dict: {
+              'input_ids', 'attention_mask', 'labels' (LongTensor),
+              'src_lang' (str), 'tgt_lang' (str), 'domain' (str)
+            }
+        """
         input_text = ' '.join(self.df[idx]['references'])
         input_text = str(self.df[idx]['page_title'] + ' ' + self.df[idx]['section_title'] + ' ' + input_text)
         target_text = self.df[idx]['content']
@@ -43,7 +80,8 @@ class Dataset1(Dataset):
             tgt_lang_code='en'
         src_lang = self.languages_map[src_lang_code][0]
         tgt_lang = self.languages_map[tgt_lang_code][0]
-
+        
+        # mT5: language prompts inside the sequence
         input_encoding = self.tokenizer(src_lang + ' ' + input_text + ' </s>', return_tensors='pt', max_length=self.max_source_length ,padding='max_length', truncation=True)
 
         target_encoding = self.tokenizer(tgt_lang + ' ' + target_text + ' </s>', return_tensors='pt', max_length=self.max_target_length ,padding='max_length', truncation=True)
@@ -58,12 +96,15 @@ class Dataset1(Dataset):
 
 
 class DataModule(pl.LightningDataModule):
+    """Lightning DataModule for evaluating mT5 models."""
     def __init__(self, *args, **kwargs):
+        """Save hyperparameters and initialize tokenizer."""
         super().__init__()
         self.save_hyperparameters()
         self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer_name_or_path)
         
     def setup(self, stage=None):
+         """Create train/val/test dataset splits sharing a tokenizer."""
         self.train = Dataset1(self.hparams.train_path, self.tokenizer, self.hparams.max_source_length, self.hparams.max_target_length, self.hparams.is_mt5)
         self.val = Dataset1(self.hparams.val_path, self.tokenizer, self.hparams.max_source_length, self.hparams.max_target_length, self.hparams.is_mt5)
         self.test = Dataset1(self.hparams.test_path, self.tokenizer, self.hparams.max_source_length, self.hparams.max_target_length, self.hparams.is_mt5)
@@ -75,14 +116,25 @@ class DataModule(pl.LightningDataModule):
         return DataLoader(self.val, batch_size=self.hparams.val_batch_size, num_workers=1,shuffle=False)
 
     def test_dataloader(self):
+        """Return test DataLoader used by `Trainer.test`."""
         return DataLoader(self.test, batch_size=self.hparams.test_batch_size, num_workers=1,shuffle=False)
 
     def predict_dataloader(self):
+        """Alias to the test DataLoader for convenience."""
         return self.test_dataloader()
         
 
 class Summarizer(pl.LightningModule):
+    """LightningModule wrapper for inference and ROUGE evaluation.
+
+    Loads the mt5 model  and provides:
+      - `_generative_step` for sequence generation without forced BOS.
+      - Aggregation of predictions and per-language ROUGE computation.
+      - CSV export of detailed rows (src/tgt lang, domain, input/ref/pred).
+    """
+
     def __init__(self, *args, **kwargs):
+        """Initialize model (mT5 here), tokenizer handle, and ROUGE."""
         super().__init__()
         self.save_hyperparameters()
         self.rouge = Rouge()
@@ -90,7 +142,7 @@ class Summarizer(pl.LightningModule):
             self.model = MT5ForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
         else:
             self.model = MBartForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
-
+        # Reused language codes (we use these as text prompts)
         self.languages_map = {
             'bn': {0:'bn_IN'},
             'en': {0:'en_XX'},
@@ -99,16 +151,25 @@ class Summarizer(pl.LightningModule):
         }
 
     def forward(self, input_ids, attention_mask, labels):
+        """Forward pass returning Hugging Face `Seq2SeqLMOutput`."""
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return outputs
 
     def _step(self, batch):
+        """Compute supervised loss for a batch."""
         input_ids, attention_mask, labels, src_lang, tgt_lang, domain = batch['input_ids'], batch['attention_mask'], batch['labels'], batch['src_lang'], batch['tgt_lang'], batch['domain']
         outputs = self(input_ids, attention_mask, labels)
         loss = outputs[0]
         return loss
     
     def _generative_step(self, batch):
+        """Run mT5 generation (no forced BOS) and decode strings.
+
+        Returns:
+            tuple(list[str], list[str], list[str], list[str], list[str], list[str]):
+                input_text, pred_text, ref_text, src_lang, tgt_lang, domain
+        """
+        # For mT5 we do not use forced_bos_token_id
         try:
             token_id = self.hparams.tokenizer.lang_code_to_id[batch['tgt_lang'][0]]
             self.hparams.tokenizer.tgt_lang = batch['tgt_lang'][0]
@@ -136,18 +197,19 @@ class Summarizer(pl.LightningModule):
         return input_text, pred_text, ref_text, src_lang, tgt_lang, domain
 
     def training_step(self, batch, batch_idx):
+        """Log training loss (included for completeness)."""
         loss = self._step(batch)
         self.log("train_loss", loss, on_epoch=True)
         return {'loss': loss}
 
     def validation_step(self, batch, batch_idx):
+        """Compute validation loss (optional for pure testing workflows)."""
         loss = self._step(batch)
-        # input_text, pred_text, ref_text = self._generative_step(batch)
         self.log("val_loss", loss, on_epoch=True)
         return 
 
     def validation_epoch_end(self, outputs):
-
+        """Optionally aggregate validation predictions and log ROUGE."""
         pred_text = []
         ref_text = []
         for x in outputs:
@@ -182,13 +244,16 @@ class Summarizer(pl.LightningModule):
 
 
     def predict_step(self, batch, batch_idx):
+        """Return decoded strings for downstream analysis."""
         input_text, pred_text, ref_text, src_lang, tgt_lang, domain = self._generative_step(batch)
         return {'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text}
 
     def on_test_epoch_start(self):
+        """Initialize container used to aggregate test outputs."""
         self.test_outputs = []
 
     def test_step(self, batch, batch_idx):
+        """Compute test loss and collect decoded strings for aggregation."""
         loss = self._step(batch)
         input_text, pred_text, ref_text, src_lang, tgt_lang, domain = self._generative_step(batch)
         output = {
@@ -204,6 +269,12 @@ class Summarizer(pl.LightningModule):
         return output
 
     def on_test_epoch_end(self):
+        """Aggregate results, compute ROUGE per target language, and save CSV.
+
+        Groups examples by `tgt_lang`, computes per-language ROUGE (avg), and
+        logs an overall macro-average. Writes a detailed CSV with input/pred/ref.
+        Also prints summary ROUGE-F1 scores to the terminal.
+        """
         input_texts = []
         pred_texts = []
         ref_texts = []
@@ -327,6 +398,7 @@ if __name__ == "__main__":
         model_name = 'facebook/mbart-large-50'
         is_mt5 = 0
     print('-----------------------------------------------------------------------------------------------------------')
+    # Default paths (override via CLI if needed)
     train_path = 'abstractive/ML-MD/mixed_train.json'
     val_path = 'abstractive/ML-MD/mixed_val.json'
     test_path = 'abstractive/ML-MD/mixed_test.json'
