@@ -102,7 +102,7 @@ def main(args):
     )
 
     model = Summarizer(**model_hparams)
-     # Sanity check
+    # Handle sanity runs (small-scale debugging)
     if args.sanity_run=='yes':
         log_model = False
         limit_train_batches = 4
