@@ -1,4 +1,16 @@
 """This code is a modified version provided at https://github.com/DhavalTaunk08/XWikiGen/tree/main"""
+"""This module defines a PyTorch Lightning `Summarizer` that fine-tunes and evaluates
+sequence-to-sequence models (mBART or mT5) for abstractive summarization across
+multiple languages and domains.
+
+Key features:
+- Supports mBART (with `forced_bos_token_id`) and mT5 (label PAD → -100 masking).
+- Performs greedy/beam generation during validation/test for ROUGE evaluation.
+- Logs ROUGE-1/ROUGE-2/ROUGE-L on validation epoch end.
+
+Notes:
+- For mBART, the target language BOS is enforced via `forced_bos_token_id`.
+"""
 import pytorch_lightning as pl
 from transformers import MBartForConditionalGeneration, MT5ForConditionalGeneration, AutoConfig, AutoModelForSeq2SeqLM, MBartTokenizer
 import torch
@@ -7,7 +19,10 @@ import json
 import pandas as pd
 
 class Summarizer(pl.LightningModule):
+    """LightningModule for multilingual, multidomain abstractive summarization."""
+
     def __init__(self, *args, **kwargs):
+        """Initialize model, tokenizer hooks, and evaluation utilities."""
         super().__init__()
         self.save_hyperparameters()
         self.rouge = Rouge()
@@ -17,7 +32,7 @@ class Summarizer(pl.LightningModule):
             self.model = MT5ForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
         else:
             self.model = MBartForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
-
+        # Minimal ISO→mBART language code map used for BOS forcing (mBART only).
         self.languages_map = {
             'bn': 'bn_IN',
             'en': 'en_XX',
@@ -25,10 +40,25 @@ class Summarizer(pl.LightningModule):
         }
 
     def forward(self, input_ids, attention_mask, labels):
+        """Run a forward pass.
+        Args:
+            input_ids (torch.LongTensor): Token IDs of shape [B, S_src].
+            attention_mask (torch.LongTensor): Attention mask of shape [B, S_src].
+            labels (torch.LongTensor): Target token IDs of shape [B, S_tgt].
+                For mT5, PADs should be set to -100 to ignore in loss.
+        Returns:
+            transformers.modeling_outputs.Seq2SeqLMOutput: Includes `loss` and logits.
+        """
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return outputs
 
     def _step(self, batch):
+        """Compute loss for a single batch.
+        Args:
+            batch (Dict[str, Tensor]): See module docstring for expected keys.
+        Returns:
+            torch.Tensor: Scalar loss tensor.
+        """
         input_ids, attention_mask, labels, src_lang, tgt_lang = batch['input_ids'], batch['attention_mask'], batch['labels'], batch['src_lang'], batch['tgt_lang']
         outputs = self(input_ids, attention_mask, labels)
         loss = outputs[0]
@@ -36,6 +66,10 @@ class Summarizer(pl.LightningModule):
     
      
     def _generative_step(self, batch):
+        """Generate predictions and decode input/pred/reference strings.
+
+        For mBART, sets `forced_bos_token_id` based on the batch target language
+        and updates `tokenizer.tgt_lang`. For mT5, no forced BOS is used."""
         tgt_lang = batch['tgt_lang'][0]
 
         if not self.hparams.is_mt5:
@@ -72,12 +106,15 @@ class Summarizer(pl.LightningModule):
         return input_text, pred_text, ref_text
 
     def training_step(self, batch, batch_idx):
+        """Compute and log training loss."""
         loss = self._step(batch)
         self.log("train_loss", loss, on_epoch=True)
         return {'loss': loss}
     def on_validation_epoch_start(self):
+        """Reset containers for validation outputs at the start of the epoch."""
         self.validation_outputs = []
     def validation_step(self, batch, batch_idx):
+        """Compute val loss, generate predictions, and appends decoded texts."""
         loss = self._step(batch)
         input_text, pred_text, ref_text = self._generative_step(batch)
         self.log("val_loss", loss, on_epoch=True)
@@ -85,6 +122,7 @@ class Summarizer(pl.LightningModule):
         return 
 
     def on_validation_epoch_end(self):
+        """Aggregate validation predictions and log ROUGE metrics. Computes ROUGE-1/2/L (precision/recall/F1) over the whole epoch."""
         pred_text = []
         ref_text = []
         for x in self.validation_outputs:
@@ -120,15 +158,35 @@ class Summarizer(pl.LightningModule):
         # Clear validation outputs after each epoch
         self.validation_outputs = []
     def predict_step(self, batch, batch_idx):
+        """Generate predictions for a batch (used by Lightning `.predict()`).
+        Args:
+            batch (Dict[str, Tensor]): Prediction batch.
+            batch_idx (int): Index of the batch.
+        Returns:
+            Dict[str, List[str]]: Decoded `input_text`, `pred_text`, `ref_text`.
+        """
         input_text, pred_text, ref_text = self._generative_step(batch)
         return {'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text}
 
     def test_step(self, batch, batch_idx):
+        """Compute test loss and return decoded strings.
+        Args:
+            batch (Dict[str, Tensor]): Test batch.
+            batch_idx (int): Index of the batch.
+        Returns:
+            Dict[str, Any]: Includes `'test_loss'`, decoded strings, and
+                `'domain'` (if present in batch; defaults to `'unknown'` list).
+        """
         loss = self._step(batch)
         input_text, pred_text, ref_text = self._generative_step(batch)
         return {'test_loss': loss, 'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text, 'domain': batch.get('domain', ['unknown'] * len(input_text))}
 
     def test_epoch_end(self, outputs):
+        """Aggregate test outputs, compute per-language scores, and save CSV.
+        Notes:
+            - Assumes `outputs` is a list of dicts returned by `test_step`.
+            - Writes a CSV of per-example predictions to `self.hparams.prediction_path`
+        """
         df_to_write = pd.DataFrame(columns=['lang', 'input_text', 'ref_text', 'pred_text', 'rouge'])
         input_text = []
         langs = []
@@ -177,10 +235,15 @@ class Summarizer(pl.LightningModule):
         return
 
     def configure_optimizers(self):
+        """Create the optimizer.
+        Returns:
+            torch.optim.Optimizer: Adam optimizer over all parameters.
+        """
         return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
 
     @staticmethod
     def add_model_specific_args(parent_parser):
+        """Register model-specific CLI args with the given parser."""
         parser = parent_parser.add_argument_group('Bart Fine-tuning Parameters')
         parser.add_argument('--learning_rate', default=1e-5, type=float)
         parser.add_argument('--model_name_or_path', default='bart-base', type=str)
