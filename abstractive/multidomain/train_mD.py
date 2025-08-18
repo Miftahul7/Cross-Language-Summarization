@@ -1,4 +1,17 @@
 """This code is a modified version provided at https://github.com/DhavalTaunk08/XWikiGen/tree/main"""
+"""
+Training script for multidomain abstractive summarization.
+This script handles model training using PyTorch Lightning. It ties together:
+- `DataModule` (from `dataloader.py`): handles dataset loading and tokenization.
+- `Summarizer` (from `model.py`): wraps mBART or mT5 for seq2seq summarization.
+- Model checkpointing with PyTorch Lightning callbacks.
+- GPU and distributed training configuration.
+
+Features:
+- Supports resuming training from the latest checkpoint automatically.
+- Allows both full training and quick "sanity runs" for debugging.
+- Saves best checkpoints and predictions to disk.
+"""
 from model.model import Summarizer 
 from model.dataloader import DataModule
 import pytorch_lightning as pl
@@ -17,13 +30,24 @@ import wandb
 wandb.login(key=" ") # API key needed
 
 def main(args):
-    
+    """Main training pipeline.
+    This function:
+    1. Sets up paths, hyperparameters, and language codes.
+    2. Instantiates the `DataModule` (for train/val/test sets).
+    3. Instantiates the `Summarizer` model with given hyperparameters.
+    4. Configures checkpointing, logging, and trainer parameters.
+    5. Resumes training from the last checkpoint if found, otherwise starts fresh.
+
+    Args:
+        args (argparse.Namespace): Command-line arguments parsed in `__main__`.
+    """
+    # Language mapping for mBART
     lang_map = {
         'bn' : 'bn_IN',
         'en' : 'en_XX',
         'hi' : 'hi_IN',
     }
-
+    # Resolve input arguments
     train_path = args.train_path
     val_path = args.val_path
     test_path = args.test_path
@@ -36,10 +60,10 @@ def main(args):
         config = args.config
     else:
         config = model_name_or_path
-
+    # Ensure prediction directory exists
     if not os.path.exists(args.prediction_path):
         os.system(f'mkdir -p {args.prediction_path}')
-
+    # Training parameters
     n_gpus = args.n_gpus
     strategy = args.strategy
     EXP_NAME = args.exp_name
@@ -52,7 +76,7 @@ def main(args):
     max_source_length = args.max_source_length
     max_target_length = args.max_target_length
     prediction_path = args.prediction_path
-
+    # DataModule hyperparameters
     dm_hparams = dict(
         train_path=train_path,
         val_path=val_path,
@@ -67,7 +91,7 @@ def main(args):
         target_lang=target_lang
     )
     dm = DataModule(**dm_hparams)
-
+    # Model hyperparameters
     model_hparams = dict(
         learning_rate=1e-5,
         model_name_or_path=model_name_or_path,
@@ -81,7 +105,7 @@ def main(args):
     )
 
     model = Summarizer(**model_hparams)
-   
+   # Handle sanity runs (small-scale debugging)
     if args.sanity_run=='yes':
         log_model = False
         limit_train_batches = 4
@@ -92,7 +116,7 @@ def main(args):
         limit_train_batches = 1.0
         limit_val_batches = 1.0
         limit_test_batches = 1.0
-    # Build dynamic filename
+    # Checkpoint filename pattern
     model_id = model_name_or_path.split('/')[-1].split('-')[0] 
     filename_pattern = f'{{epoch}}_{{step}}_salience_{args.target_lang}_{model_id}'
 
