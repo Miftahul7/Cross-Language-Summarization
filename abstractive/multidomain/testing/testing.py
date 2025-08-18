@@ -1,8 +1,7 @@
 """
 Evaluation and inference for multidomain abstractive summarization.
 
-This script loads a trained checkpoint of the `Summarizer` (see model.py),
-evaluates it on a JSONL test split, computes ROUGE, and writes detailed
+This script loads a trained checkpoint, evaluates it on a JSONL test split, computes ROUGE, and writes detailed
 predictions to a CSV. It mirrors the train-time data pipeline but focuses
 on **testing/inference**.
 
