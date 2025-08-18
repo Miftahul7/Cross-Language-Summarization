@@ -3,7 +3,7 @@ Evaluation and inference for multidomain abstractive summarization.
 
 This script loads a trained checkpoint, evaluates it on a JSONL test split, computes ROUGE, and writes detailed
 predictions to a CSV. It mirrors the train-time data pipeline but focuses
-on **testing/inference**.
+on testing/inference.
 
 Workflow:
 1) Parse command-line args and infer language/model from checkpoint file name.
