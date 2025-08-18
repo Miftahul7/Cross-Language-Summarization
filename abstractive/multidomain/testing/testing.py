@@ -1,3 +1,18 @@
+"""
+Evaluation and inference for multidomain abstractive summarization.
+
+This script loads a trained checkpoint of the `Summarizer` (see model.py),
+evaluates it on a JSONL test split, computes ROUGE, and writes detailed
+predictions to a CSV. It mirrors the train-time data pipeline but focuses
+on **testing/inference**.
+
+Workflow:
+1) Parse command-line args and infer language/model from checkpoint file name.
+2) Build a Lightning `DataModule` with JSONL-backed `Dataset1`.
+3) Load a `Summarizer` from checkpoint with the correct tokenizer/model.
+4) Run `trainer.test()` → aggregates predictions and ROUGE in `on_test_epoch_end`.
+5) Save a CSV with columns: [input_text, domain, ref_text, pred_text, rouge]. 
+"""
 from torch.utils.data import Dataset, DataLoader
 import os
 import pytorch_lightning as pl
@@ -12,7 +27,22 @@ import argparse
 from rouge import Rouge
 
 class Dataset1(Dataset):
+    """ JSONL-backed seq2seq dataset for testing/evaluation.
+    Builds encoder input as:
+        "<page_title> <section_title> <references_joined>"
+    and uses `content` as the decoder target. Includes `domain` in each item
+    for domain-/language-wise reports at test time.
+    """
     def __init__(self, data_path, tokenizer, max_source_length, max_target_length, target_lang, is_mt5):
+        """ Initialize the dataset.
+        Args:
+            data_path (str): Path to JSONL file (one example per line).
+            tokenizer (transformers.PreTrainedTokenizerBase): Tokenizer instance.
+            max_source_length (int): Max encoder sequence length.
+            max_target_length (int): Max decoder sequence length.
+            target_lang (str): Target language code (not used here explicitly).
+            is_mt5 (bool): If True, replace pad tokens in labels with -100 for loss masking.
+        """
         fp = open(data_path, 'r')
         self.df = [json.loads(line, strict=False) for line in fp.readlines()]
         self.tokenizer = tokenizer
@@ -21,9 +51,11 @@ class Dataset1(Dataset):
         self.is_mt5 = is_mt5
 
     def __len__(self):
+        """Return the number of examples."""
         return len(self.df)
 
     def __getitem__(self, idx):
+        """Create a tokenized example for index `idx`."""
         input_text = ' '.join(self.df[idx]['references'])
         input_text = str(self.df[idx]['page_title'] + ' ' + self.df[idx]['section_title'] + ' ' + input_text)
         target_text = self.df[idx]['content']
@@ -42,7 +74,9 @@ class Dataset1(Dataset):
         return {'input_ids': input_ids.squeeze(), 'attention_mask': attention_mask.squeeze(), 'labels': labels.squeeze(), 'domain':domain}
 
 class DataModule(pl.LightningDataModule):
+    """ PyTorch Lightning DataModule for test-time evaluation."""
     def __init__(self, *args, **kwargs):
+        """Store hyperparameters and initialize tokenizer."""
         super().__init__()
         self.save_hyperparameters()
         self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer_name_or_path, tgt_lang=self.hparams.tgt_lang)
@@ -53,20 +87,26 @@ class DataModule(pl.LightningDataModule):
         self.test = Dataset1(self.hparams.test_path, self.tokenizer, self.hparams.max_source_length, self.hparams.max_target_length, self.hparams.tgt_lang, self.hparams.is_mt5)
 
     def train_dataloader(self):
+        """Return the training dataloader."""
         return DataLoader(self.train, batch_size=self.hparams.train_batch_size, num_workers=1,shuffle=True)
 
     def val_dataloader(self):
+        """Return the validation dataloader."""
         return DataLoader(self.val, batch_size=self.hparams.val_batch_size, num_workers=1,shuffle=False)
 
     def test_dataloader(self):
+        """Return the test dataloader."""
         return DataLoader(self.test, batch_size=self.hparams.test_batch_size, num_workers=1,shuffle=False)
 
     def predict_dataloader(self):
+        """Alias for the test dataloader (used by Lightning `predict`)."""
         return self.test_dataloader()
         
 
 class Summarizer(pl.LightningModule):
+    """ LightningModule wrapper for mBART/mT5 during inference/testing."""
     def __init__(self, *args, **kwargs):
+        """Initialize the summarization model and ROUGE scorer."""
         super().__init__()
         self.save_hyperparameters()
         self.rouge = Rouge()
@@ -76,27 +116,36 @@ class Summarizer(pl.LightningModule):
             self.model = MBartForConditionalGeneration.from_pretrained(self.hparams.model_name_or_path)
 
     def forward(self, input_ids, attention_mask, labels):
+        """Forward pass for computing loss (not used during pure generation)."""
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return outputs
 
     def _step(self, batch):
+        """Compute supervised loss (useful when labels are available). """
         input_ids, attention_mask, labels, domain = batch['input_ids'], batch['attention_mask'], batch['labels'], batch['domain']
         outputs = self(input_ids, attention_mask, labels)
         loss = outputs[0]
         return loss
     
     def _generative_step(self, batch):
+        """ Generate summaries and decode input/pred/reference strings.
+        Args:
+            batch (dict): Contains input_ids, attention_mask, labels, domain.
+        Returns:
+            tuple(list[str], list[str], list[str], list[str]): (input_text, pred_text, ref_text, domain)
+        """
         generated_ids = self.model.generate(
             input_ids=batch['input_ids'],
             attention_mask=batch['attention_mask'],
             use_cache=True,
             num_beams=self.hparams.eval_beams,
-            max_length=self.hparams.tgt_max_seq_len #understand above 3 arguments
+            max_length=self.hparams.tgt_max_seq_len 
             )
 
         input_text = self.hparams.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
         pred_text = self.hparams.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         if self.hparams.is_mt5:
+            # Restore pad tokens before decoding references
             batch['labels'][batch['labels'] == -100] = self.hparams.tokenizer.pad_token_id
         ref_text = self.hparams.tokenizer.batch_decode(batch['labels'], skip_special_tokens=True)
         domain = batch['domain']
@@ -104,18 +153,20 @@ class Summarizer(pl.LightningModule):
         return input_text, pred_text, ref_text, domain
 
     def training_step(self, batch, batch_idx):
+        """(Optional) training step; present for API parity."""
         loss = self._step(batch)
         self.log("train_loss", loss, on_epoch=True)
         return {'loss': loss}
 
     def validation_step(self, batch, batch_idx):
+        """(Optional) validation step; present for API parity."""
         loss = self._step(batch)
         input_text, pred_text, ref_text = self._generative_step(batch)
         self.log("val_loss", loss, on_epoch=True)
         return 
 
     def validation_epoch_end(self, outputs):
-
+        """(Optional) validation epoch end; left as in original implementation."""
         pred_text = []
         ref_text = []
         for x in outputs:
@@ -150,19 +201,23 @@ class Summarizer(pl.LightningModule):
 
 
     def predict_step(self, batch, batch_idx):
+        """Lightning predict step: return decoded input/pred/ref texts."""
         input_text, pred_text, ref_text = self._generative_step(batch)
         return {'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text}
     
     def on_test_start(self):
+        """Initialize container for test outputs before evaluation begins."""
         self.test_outputs = []
         
     def test_step(self, batch, batch_idx):
+        """Accumulate per-batch predictions and loss for later aggregation."""
         loss = self._step(batch)
         input_text, pred_text, ref_text, domain = self._generative_step(batch)
         output = {'test_loss': loss, 'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text, 'domain': domain}
         self.test_outputs.append(output)
         return output
     def on_test_epoch_end(self):
+        """Aggregate test results, compute ROUGE, and save CSV to disk."""
         
         df_to_write = pd.DataFrame(columns=['input_text', 'domain', 'ref_text', 'pred_text', 'rouge'])
         input_texts = []
@@ -204,6 +259,7 @@ class Summarizer(pl.LightningModule):
 
     @staticmethod
     def add_model_specific_args(parent_parser):
+        """Add model-specific CLI arguments (kept for parity with train-time)."""
         parser = parent_parser.add_argument_group('Bart Fine-tuning Parameters')
         parser.add_argument('--learning_rate', default=1e-5, type=float)
         parser.add_argument('--model_name_or_path', default='bart-base', type=str)
@@ -229,7 +285,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     prediction_path = args.prediction_path
-
+    # Infer settings
     ckpt_path = args.ckpt_path
     ckpt_path_1 = ckpt_path.split('/')[-1]
     method = ckpt_path_1.split('_')[2]
@@ -247,6 +303,7 @@ if __name__ == "__main__":
 
     print('-----------------------------------------------------------------------------------------------------------')
     print(lang, model_name)
+    # Build data split paths
     train_path = 'XWikiRef/md_split/' + lang + '/' + lang + '_train.json'
     val_path = 'XWikiRef/md_split/' + lang + '/' + lang + '_val.json'
     test_path = 'XWikiRef/md_split/' + lang + '/' + lang + '_test.json'
@@ -256,7 +313,7 @@ if __name__ == "__main__":
         'en' : 'en_XX',
         'hi' : 'hi_IN',
     }
-
+    # Lightning DataModule
     target_lang = lang_map[lang]
     dm_hparams = dict(
             train_path=train_path,
@@ -271,7 +328,7 @@ if __name__ == "__main__":
             test_batch_size=args.batch_size,
             tgt_lang=lang_map[lang])
     dm = DataModule(**dm_hparams)
-
+    # Model config
     model_hparams = dict(
             learning_rate=1e-5,
             model_name_or_path=model_name,
@@ -281,10 +338,10 @@ if __name__ == "__main__":
             tokenizer=dm.tokenizer,
         )
 
-   
+    # WandB / Trainer
     logger=WandbLogger(name='inference_' + method + '_' + lang +  '_' + model_name, save_dir='./', project='multidomain evaluation', log_model=False)
     trainer = pl.Trainer(accelerator="gpu", devices=1, logger=logger)
-
+    # Load & run evaluation
     model = Summarizer.load_from_checkpoint(ckpt_path, **model_hparams)
     results = trainer.test(model=model, datamodule=dm, verbose=True)
     print('-----------------------------------------------------------------------------------------------------------')
