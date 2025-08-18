@@ -1,3 +1,15 @@
+"""this script is used to Test Inference & ROUGE Evaluation for MT5 (PyTorch Lightning).
+
+This script loads a trained checkpoint for a multilingual abstractive summarization model
+for mT5; constructs dataloaders from JSONL files, runs generation on the test split, and
+computes ROUGE scores. Results are aggregated overall and per target language, then
+optionally written to disk.
+
+Notes:
+- The script parses the checkpoint file name to infer ``method``, ``domain``, and
+  ``model_name``. Adjust if the checkpoint naming scheme differs.
+- Per-language ROUGE is logged via a global ``logger`` (W&B) created in ``__main__``.
+"""
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 from transformers import AutoTokenizer
@@ -13,7 +25,13 @@ import sys
 import os
 
 class Dataset1(Dataset):
+    """JSONL-backed dataset for multilingual abstractive summarization (test-time).
+
+    When ``is_mt5`` is true, language tags are prepended to the text as simple prompts
+    (e.g., ``"en_XX <text> </s>"``). For loss computation with T5-style models, pad
+    tokens in ``labels`` are masked to ``-100``."""
     def __init__(self, data_path, tokenizer, max_source_length, max_target_length, is_mt5):
+         """Initialize dataset and load JSONL into memory."""
         fp = open(data_path, 'r')
         self.df = [json.loads(line, strict=False) for line in fp.readlines()]
         self.tokenizer = tokenizer
@@ -27,9 +45,19 @@ class Dataset1(Dataset):
         }
 
     def __len__(self):
+        """Return the number of examples in the dataset."""
         return len(self.df)
 
     def __getitem__(self, idx):
+         """Compose, tokenize, and return one example for evaluation.
+
+        The source text is ``page_title + section_title + ' '.join(references)`` and the
+        target is the ``content`` field. Unknown language codes default to English.
+
+        Returns:
+            dict: ``{"input_ids", "attention_mask", "labels", "src_lang", "tgt_lang"}``
+            where ids/masks are 1D tensors and langs are strings.
+        """
         input_text = ' '.join(self.df[idx]['references'])
         input_text = str(self.df[idx]['page_title'] + ' ' + self.df[idx]['section_title'] + ' ' + input_text)
         target_text = self.df[idx]['content']
@@ -56,7 +84,14 @@ class Dataset1(Dataset):
 
 
 class DataModule(pl.LightningDataModule):
+     """Lightning DataModule for test-time multilingual summarization.
+
+    Creates a single shared tokenizer and instantiates train/val/test datasets.
+    Only the test dataloader is required for this script; others are provided
+    for API completeness."""
+
     def __init__(self, *args, **kwargs):
+        """Initialize the DataModule and create the tokenizer from pretrained name/path."""
         super().__init__()
         self.save_hyperparameters()
         self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.tokenizer_name_or_path)
@@ -73,14 +108,22 @@ class DataModule(pl.LightningDataModule):
         return DataLoader(self.val, batch_size=self.hparams.val_batch_size, num_workers=1,shuffle=False)
 
     def test_dataloader(self):
+         """Return the test dataloader consumed by ``Trainer.test``."""
         return DataLoader(self.test, batch_size=self.hparams.test_batch_size, num_workers=1,shuffle=False)
 
     def predict_dataloader(self):
+        """Alias to ``test_dataloader`` for Lightning's predict loop."""
         return self.test_dataloader()
         
 
 class Summarizer(pl.LightningModule):
+    """LightningModule for generation and ROUGE computation at test time.
+
+    Wraps a Hugging Face seq2seq model (mT5 or mBART depending on ``is_mt5``) and
+    exposes helper steps for loss computation and text generation. Although, we use this script only for mt5
+    """
     def __init__(self, *args, **kwargs):
+        """Initialize the model and ROUGE scorer from ``self.hparams``."""
         super().__init__()
         self.save_hyperparameters()
         self.rouge = Rouge()
@@ -97,16 +140,30 @@ class Summarizer(pl.LightningModule):
         }
 
     def forward(self, input_ids, attention_mask, labels):
+         """Forward pass through the seq2seq model to obtain loss/logits.
+         Returns:
+            transformers.modeling_outputs.Seq2SeqLMOutput: HF output object.
+        """
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         return outputs
 
     def _step(self, batch):
+        """Compute supervised loss for a batch (useful for logging)."""
         input_ids, attention_mask, labels, src_lang, tgt_lang = batch['input_ids'], batch['attention_mask'], batch['labels'], batch['src_lang'], batch['tgt_lang']
         outputs = self(input_ids, attention_mask, labels)
         loss = outputs[0]
         return loss
     
     def _generative_step(self, batch):
+        """Generate summaries and decode input/pred/reference strings.
+
+        For mT5, generation uses standard settings (no ``forced_bos_token_id``);
+        for mBART, the code attempts to set the tokenizer's ``tgt_lang`` (best-effort).
+
+        Returns:
+            Tuple[List[str], List[str], List[str], List[str], List[str]]: input, pred,
+            ref, src_lang, tgt_lang (lists of strings).
+        """
         try:
             token_id = self.hparams.tokenizer.lang_code_to_id[batch['tgt_lang'][0]]
             self.hparams.tokenizer.tgt_lang = batch['tgt_lang'][0]
@@ -179,13 +236,16 @@ class Summarizer(pl.LightningModule):
 
 
     def predict_step(self, batch, batch_idx):
+        """Lightning predict step: return decoded strings for downstream analysis."""
         input_text, pred_text, ref_text, src_lang, tgt_lang = self._generative_step(batch)
         return {'input_text': input_text, 'pred_text': pred_text, 'ref_text': ref_text}
 
     def on_test_epoch_start(self):
+        """Initialize buffers to collect test outputs across batches."""
         self.test_outputs = []
 
     def test_step(self, batch, batch_idx):
+        """Lightning test step: compute loss, decode strings, and buffer outputs."""
         loss = self._step(batch)
         input_text, pred_text, ref_text, src_lang, tgt_lang = self._generative_step(batch)
         output = {
@@ -200,6 +260,13 @@ class Summarizer(pl.LightningModule):
         return output
 
     def on_test_epoch_end(self):
+         """Aggregate per-language ROUGE, write CSV, and print summary.
+
+        This function collects decoded strings from all test batches, groups them by
+        target language, computes average ROUGE, logs to a global W&B ``logger``, and
+        writes a CSV under ``abstractive/multilingual/predictions``. It finally prints
+        a concise ROUGE-F1 summary to the console and returns a dict of key metrics.
+        """
         input_texts = []
         pred_texts = []
         ref_texts = []
