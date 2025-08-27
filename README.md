@@ -26,13 +26,16 @@ selection of 20 better articles from each language-domain pair to create this su
 
 ### Scripts
 - `clean.py` – Preprocesses each (language, domain) JSON file (e.g., `bn_writers.json`).
-- `mD_split.py` – Splits data for Multidomain experiments (80:10:10). For a particular language, it takes each domain as input and splits it in an 80:10:10 ratio and saves it in the perDomainperLang folder. Then, it merges and shuffles all the domain’s training sets to create a training set (e.g., bn_train.json). A similar approach is used to get validation sets and test sets. This makes sure every domain is present in all the splits.
-- `mL_split.py` – Splits data for Multilingual experiments. From the perDomainperLang folder, it merges the train sets of all languages for each domain to create a single train set (e.g., writers_train.json). A similar approach is used to get validation sets and test sets.
-- `mLmD_split.py` – Aplits data for ML-MD experiments. It utilizes splits from the Multilingual task, merging the training sets of all domains to create a comprehensive training set comprising 12 domain-language pairs. A similar approach is used to get validation sets and test sets.
+- `mD_split.py` – Splits data for Multidomain experiments (80:10:10). For a particular language, it takes each domain as input and splits it in an 80:10:10 ratio and saves it in the `perDomainperLang folder`. Then, it merges and shuffles all the domain’s training sets to create a training set (e.g., bn_train.json). A similar approach is used to get validation sets and test sets. This makes sure every domain is present in all the splits.
+- `mL_split.py` – Splits data for Multilingual experiments. From the `perDomainperLang folder`, it merges the train sets of all languages for each domain to create a single train set (e.g., writers_train.json). A similar approach is used to get validation sets and test sets.
+- `mLmD_split.py` – Splits data for ML-MD experiments. It utilizes splits from the Multilingual task, merging the training sets of all domains to create a comprehensive training set comprising 12 domain-language pairs. A similar approach is used to get validation sets and test sets.
 
 ---
 
 ## Extractive Stage
+Input: For the Initial-20 dataset, raw data files are used. For the Curated-20 dataset, pre-processed data files are used as input for this stage.
+
+Next Step: The output of the extractive stage is further divided into train, test, and validation sets using the split scripts available in `Data/.`
 
 ### Folder: `extractive/`
 - `extractive.{py, sh}` – Extracts top-k salient sentences from cleaned language-domain data.
@@ -41,7 +44,7 @@ selection of 20 better articles from each language-domain pair to create this su
 
 ## Abstractive Stage
 
-Each experimental setting has its folder inside `abstractive/`.
+Each experimental setting has its folder inside `abstractive/`. The output from the extractive stage is split into train, validation, and test sets as required by the experimental setup, which then serve as the input to this stage.
 
 ### 1. `Multidomain/`
 - `model/dataloader.py` – PyTorch Lightning `DataModule` for loading and tokenizing data.
